@@ -1,0 +1,1540 @@
+---
+title: "FEATURE SELECTION"
+output: html_notebook
+---
+
+```{r Load data, include=FALSE}
+library(xgboost)
+library(caret)
+library(lubridate)
+library(readr)
+library(dplyr)
+library(reticulate)
+library(stringr)
+
+setwd("D:/Dataset/Unir/data_tfm/TFM_PROD")
+
+# Cargar los datos
+data <- read_csv("bigx_users_sakai_8/bigx_users_sakai_8.csv",
+                 show_col_types = F,
+                 progress = F) %>% select(-where(is.logical))
+
+data_7 <- read_csv("bigx_users_sakai_7/bigx_users_sakai_7.csv",
+                   show_col_types = F,
+                   progress = F) 
+
+```
+
+```{r Distribución de las clases}
+# Crear el diagrama de barras usando ggplot2
+ggplot(data %>% count(marca_abandono), aes(x = as.factor(marca_abandono), y = n)) +
+  geom_bar(stat = "identity", fill = "#2f4b7c") +
+  geom_text(aes(label = n), vjust = -0.5, color = "black", size = 3.5) +
+  labs(title = "Distribución de la marca de abandono", x = "Marca de Abandono", y = "Total registros")
+
+```
+
+```{r Eliminar columnas con todos valores faltantes}
+na_percentage <- sapply(data, function(x) sum(is.na(x)) / length(x) * 100)
+na_count <- data.frame(na_percentage)
+vars_select1 <- na_count %>% filter(na_percentage<30) %>% row.names()
+data_na  <- data %>% select(all_of(vars_select1)) ;dim(data_na)
+```
+
+```{r Eliminación de columnas redundantes}
+datai <- data_na %>% 
+  select(-contains("tres_up_doc"),
+         -contains("tres_up_prog"))
+
+datai %>% dim()
+```
+
+```{r Predictores de varianza cero y casi cero}
+nzv <- nearZeroVar(datai %>% select(where(is.numeric),-marca_abandono))
+dat_nzv <- datai[, -nzv]
+dim(dat_nzv)
+```
+
+```{r Eliminación de variables por Information Value y Correlación}
+library(Information)
+library(dplyr)
+library(Hmisc)
+library(caret)
+
+# Definir la función
+calcular_iv_y_correlacion <- function(df, target_col, iv_threshold = 0.02, corr_threshold = 0.8) {
+  # Calcular el Information Value (IV) de cada variable
+  iv <- create_infotables(data = df, y = target_col, bins = 10, parallel = FALSE)
+  
+  # Extraer el DataFrame de IV
+  iv_values <- iv$Summary
+  
+  # Filtrar variables con IV bajo
+  variables_to_keep <- iv_values %>%
+    filter(IV >= iv_threshold) %>%
+    pull(Variable)
+  
+  # Filtrar el DataFrame original para mantener solo las variables con IV suficiente
+  df_filtered_iv <- df %>%
+    select(all_of(c(target_col, variables_to_keep)))
+  
+  # Calcular la matriz de correlación
+  cor_matrix <- rcorr(as.matrix(df_filtered_iv[-1]))  # Excluir la columna de respuesta
+  cor_matrix_r <- cor_matrix$r
+  
+  # Identificar variables altamente correlacionadas
+  highly_correlated_pairs <- which(abs(cor_matrix_r) > corr_threshold, arr.ind = TRUE)
+  highly_correlated_pairs <- highly_correlated_pairs[highly_correlated_pairs[,1] != highly_correlated_pairs[,2], ]
+  
+  # Crear una lista de variables a eliminar basadas en IV
+  variables_to_remove <- c()
+  for (i in 1:nrow(highly_correlated_pairs)) {
+    var1 <- colnames(cor_matrix_r)[highly_correlated_pairs[i, 1]]
+    var2 <- colnames(cor_matrix_r)[highly_correlated_pairs[i, 2]]
+    
+    if (!var1 %in% variables_to_remove && !var2 %in% variables_to_remove) {
+      iv_var1 <- iv_values[iv_values$Variable == var1, "IV"]
+      iv_var2 <- iv_values[iv_values$Variable == var2, "IV"]
+      
+      if (iv_var1 >= iv_var2) {
+        variables_to_remove <- c(variables_to_remove, var2)
+      } else {
+        variables_to_remove <- c(variables_to_remove, var1)
+      }
+    }
+  }
+  
+  # Eliminar variables duplicadas en la lista
+  variables_to_remove <- unique(variables_to_remove)
+  
+  # Crear un nuevo DataFrame sin las variables eliminadas
+  df_final <- df_filtered_iv %>%
+    select(-one_of(variables_to_remove))
+  
+  # Mostrar las variables eliminadas y el DataFrame final
+  list(
+    variables_eliminadas = variables_to_remove,
+    df_final = df_final
+  )
+}
+
+# Ejemplo de uso
+resultados <- calcular_iv_y_correlacion(dat_nzv, "marca_abandono", iv_threshold = 0.1, corr_threshold = 0.8)
+
+print("DataFrame final:")
+#resultados$df_final %>% colnames()
+resultados$df_final %>% dim()
+```
+
+```{r Eliminación de variables menos significativos según la prueba de KS}
+dt_temp1 <- resultados$df_final %>% #select(-key_id) %>% 
+  mutate(ID = seq(1, nrow(data), 1))
+
+dt_temp1$Flag_Cliente <- factor(
+  data$marca_abandono,
+  levels = c(0, 1),
+  labels = c("NoDropout", "Dropout"))
+
+dt_temp1 <- data.table::data.table(dt_temp1)
+df_fields <- data.frame(
+  ID_var = 1:1,
+  variable = setdiff(colnames(dt_temp1), c("ID", "marca_abandono", "Flag_Cliente")),
+  stringsAsFactors = F)
+
+n <- nrow(dt_temp1)
+n_var <- nrow(df_fields)
+
+for (i in 1:n_var) {
+  dt_temp2 <- dt_temp1[,list(ID,x=get(df_fields$variable[ID_var=i]), Flag_Cliente)]
+  dt_temp2 <- dt_temp2[!is.na(x),]
+  v1<- quantile(dt_temp2$x, probs = seq(0,1,.10),na.rm = T, names = F)[2:11]
+  dt_temp2$cat<-NA
+  for (j in 1:length(v1)) {
+    dt_temp2 <- within(dt_temp2,{
+      cat[is.na(cat) & x<=v1[j]]=j})
+  }
+  df_table0 <-data.table::dcast(dt_temp2, cat~Flag_Cliente, fun.aggregate = function(x) sum(!is.na(x)), value.var = "ID")
+  df_table0 <- cbind(df_table0, Recov_rel=round(100*cumsum(prop.table(df_table0$Dropout)),1),
+                     NoRecov_rel=round(100*cumsum(prop.table(df_table0$NoDropout)),1) ,
+                     Diff=abs(round(100*(cumsum(prop.table(df_table0$Dropout))-cumsum(prop.table(df_table0$NoDropout))),1)))
+  df_table1 <- data.frame(ID=i,variable=df_fields$variable[i])
+  df_table1$KS <- max(df_table0$Diff)
+  if (i==1) {df_varfinal <- df_table1}
+  else {df_varfinal <- rbind(df_varfinal,df_table1)}
+}
+data_ks <- df_varfinal %>% filter(KS > 9) %>% arrange(desc(KS))
+
+ggplot(data_ks, aes(x = reorder(variable, KS), y = KS)) +
+  geom_bar(stat = "identity", fill = "#2f4b7c") +
+  coord_flip() +  # Hacer que las barras sean horizontales
+  labs(title = "Variables y sus valores KS",
+       x = "Variable",
+       y = "Valor KS") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8))
+
+data_cor <- resultados$df_final
+
+varsfinal <- (df_varfinal %>% filter(KS > 9))$variable
+
+data_ks_nominal <- data_cor %>% 
+  select(all_of(varsfinal))
+
+data_cor_ks_nominal <-data_ks_nominal %>% 
+  bind_cols(data_cor %>% select(marca_abandono)) %>% 
+  select(marca_abandono,everything())
+
+modelodata <- data_cor_ks_nominal; modelodata %>% dim();
+```
+
+```{r Opcional: Análisis WOEs - Creación de bins}
+library(scorecard)
+bins = woebin(modelodata, y = 'marca_abandono')
+woebin_plot(bins)
+```
+
+```{r Opcional: Aplicando transformaciones de WOEs}
+# strain
+data_model_woe = woebin_ply( modelodata, bins ) %>%
+  as.data.frame() %>% 
+  mutate(marca_abandono=as.integer(if_else(marca_abandono=="1",1,0)))
+
+data_model_test_woe <- data_7 %>% select(all_of(colnames(modelodata))) %>% 
+  woebin_ply( ., bins ) %>%
+  as.data.frame() %>% 
+  mutate(marca_abandono=as.integer(if_else(marca_abandono=="1",1,0)))
+
+```
+
+
+```{r Imputación de datos/New Names}
+data_model = modelodata %>%
+  mutate(marca_abandono=as.integer(if_else(marca_abandono=="1",1,0))) %>%
+  mutate_if(is.numeric,~if_else(is.na(.),-9999,.))
+
+data_model_test <- data_7 %>% select(colnames(modelodata)) %>%
+  mutate(marca_abandono=as.integer(if_else(marca_abandono=="1",1,0)))%>%
+  mutate_if(is.numeric,~if_else(is.na(.),-9999,.))
+
+new_names <- c('marca_abandono',
+'tt_empieza_evaluacion_prom4s',
+'tt_envia_evaluacion_peranalisis',
+'tt_lee_msg_foros_prom3s',
+'tt_lee_msg_foros_min2s',
+'tt_empieza_evaluacion_diff2s',
+'tt_lee_msg_foros_min4s',
+'tt_envia_evaluacion_sem4',
+'tt_lee_msg_foros_sem2',
+'tt_login_min4s',
+'tt_envia_evaluacion_sem3',
+'tt_visita_sitio_min4s',
+'tt_lee_msg_foros_peranalisis',
+'tt_empieza_evaluacion_min2s',
+'tt_lee_msg_foros_sem3',
+'tt_empieza_evaluacion_sem2',
+'tt_visita_sitio_median4s',
+'tcursos_eventos_min4s',
+'tt_lee_msg_foros_sem4',
+'tt_lee_temas_prom4s',
+'tt_empieza_evaluacion_min3s',
+'tt_visita_sitio_sem4',
+'tt_descarga_recursos_min3s',
+'tt_lee_temas_sem3',
+'tt_inicia_clases_min4s',
+'tt_lee_temas_sem4',
+'tt_visita_sitio_peranalisis',
+'tt_visita_sitio_sem2',
+'tt_lee_temas_diff4s',
+'tcursos_eventos_min2s',
+'tt_descarga_recursos_median3s',
+'tasignaturas',
+'tcursos_eventos_sem3',
+'tt_inicia_clases_median4s',
+'tt_lee_temas_min2s',
+'tt_crea_msg_foros_median2s',
+'tt_inicia_clases_min2s',
+'tt_inicia_clases_sem3',
+'tt_lee_temas_peranalisis',
+'tt_descarga_recursos_foros_max4s',
+'tt_lee_correo_interno_sem4',
+'tt_carga_recurso_prom4s',
+'tt_descarga_recursos_peranalisis',
+'tt_lee_temas_sem2',
+'tt_descarga_recursos_sem3',
+'tt_responde_msg_foro_prom4s',
+'tt_descarga_recursos_foros_median4s',
+'tcursos_eventos_sem2',
+'tt_envia_tarea_prom3s',
+'tt_carga_recurso_sem2',
+'tt_descarga_recursos_sem2',
+'tt_inicia_clases_sem4',
+'tt_inicia_clases_sem2',
+'tt_lee_temas_var3s',
+'tt_envia_tarea_sem2',
+'tt_descarga_recursos_foros_sem2',
+'tt_descarga_recursos_foros_sem4',
+'tt_descarga_recursos_tareas_sem3',
+'tt_descarga_recursos_doc_min2s',
+'tt_lee_temas_var2s',
+'tt_descarga_recursos_var2s')
+
+colnames(data_model) <- new_names
+colnames(data_model_test) <- new_names
+
+```
+
+```{r División de conjunto de datos TRAIN-TEST }
+set.seed(1234)
+entrenamiento <- createDataPartition(data_model$marca_abandono,
+                                     p = 3/4,list = F)
+
+train<- data_model[entrenamiento,];
+test <- data_model[-entrenamiento,] 
+toda <- data_model
+
+#definiendo las matrices a usar
+x_reduced <-train %>% dplyr::select(-c(marca_abandono))
+ynum <-train$marca_abandono
+
+x_reduced_test <-test %>% dplyr::select(-c(marca_abandono))
+ynum_test <-test$marca_abandono
+
+x_reduced_toda <-toda %>% dplyr::select(-c(marca_abandono))
+ynum_toda <-toda$marca_abandono
+
+x_backtest <- data_model_test %>% dplyr::select(-c(marca_abandono)) 
+y_backtest <- data_model_test$marca_abandono
+```
+
+```{r Seleccion de hiperparámetros CV }
+library(mlflow)
+Sys.setenv(MLFLOW_TRACKING_URI = "http://localhost:5000")
+
+# Configurar control de entrenamiento
+cntrl <- caret::trainControl(
+  method = "cv",          # Validación cruzada
+  number = 5,             # Número de pliegues
+  verboseIter = F,     # Mostrar mensajes durante el proceso
+  returnData = FALSE,     # No retornar los datos originales
+  returnResamp = "final",  # Retornar los resultados del reentrenamiento final
+  allowParallel = F
+)
+
+################################################################################
+# XGBOOST
+# Definir la grilla de hiperparámetros XGBOOST
+grid <-expand.grid(nrounds=c(40,60,80,100,120,150), # Número de árboles (rondas de boosting)
+                  colsample_bytree=c(0.5,1), # Proporción de columnas muestreadas en cada árbol
+                  min_child_weight=1, # Peso mínimo de la suma de las instancias de hijos
+                  eta=c(0.1,0.3,0.4,0.5), # Tasa de aprendizaje
+                  gamma=c(0.25,0.5), # Mínima pérdida reducida necesaria para realizar una partición adicional
+                  subsample=c(0.5,0.75,1), # Proporción de datos muestreados en cada árbol
+                  max_depth=c(3,4,5)) # Profundidad máxima de los árboles
+
+# Entrenar el modelo con validación cruzada y optimización de hiperparámetros
+
+set.seed(1234)
+# Crear el modelo ajustando los pesos de las clases
+train_cv <- caret::train(
+  x = as.matrix(x_reduced),                   # Datos de características
+  y = as.factor(ynum),                        # Variable objetivo como factor
+  trControl = cntrl,               # Control de entrenamiento
+  tuneGrid = grid,                 # Grilla de hiperparámetros
+  weights = ifelse(ynum == 1, 1.5, 1),  # Cambia pesos de las clases
+  method = "xgbTree",              # Método de entrenamiento (XGBoost con árboles de decisión)
+  metric = "Kappa"            # Métrica para evaluar el rendimiento del modelo
+)
+# Mejor combinación de hiperparámetros
+best_hp_xgboost <- train_cv$bestTune
+print(best_hp_xgboost)
+
+################################################################################
+# RANDOM FOREST
+# Definir la grilla de hiperparámetros RANDOM FOREST
+mtry_values <- round(seq(2, ncol(x_reduced), length.out = 10))  # Ajusta 10 valores equidistantes
+grid_rf <- expand.grid(mtry = c(2, sqrt(ncol(x_reduced)), ncol(x_reduced)/2))  # Usar unique por si hay valores repetidos
+
+#Crear el modelo ajustando los pesos de las clases
+set.seed(1234)
+train_cv_rf <- caret::train(
+  x = as.matrix(x_reduced),
+  y = as.factor(ynum),
+  method = "rf",
+  weights = ifelse(ynum == 1, 1.5, 1),
+  trControl = cntrl,
+  tuneGrid = grid_rf
+)
+
+# Mejor combinación de hiperparámetros
+best_hp_rf <- train_cv_rf$bestTune
+print(best_hp_rf)
+
+################################################################################
+# SVM
+# Definir una grid de búsqueda para ajustar los hiperparámetros
+tune_grid <- expand.grid(C = 2^(-2:2), sigma = 2^(-2:2))
+set.seed(1234)
+# Entrenamiento del modelo SVM con ajuste de hiperparámetros
+train_cv_svm <- train(x = as.matrix(x_reduced),
+                   y = as.factor(ynum),
+                   method = "svmRadial",
+                   trControl = cntrl,
+                   weights = ifelse(ynum == 1, 1.5, 1),
+                   preProcess = c("center", "scale"),
+                   tuneGrid = tune_grid)
+
+# Mejor combinación de hiperparámetros
+best_hp_svm <- train_cv_svm$bestTune
+print(best_hp_svm)
+
+################################################################################
+# GLMNET
+# Definir una grid de búsqueda para ajustar los hiperparámetros
+tune_grid_glm <- expand.grid(alpha = seq(0, 1, length = 10),  # Alpha 0 para ridge, 1 para lasso, y valores intermedios para elastic net
+                         lambda = 10^seq(-3, 3, length = 100))  # Valores de lambda
+set.seed(1234)
+# Entrenamiento del modelo glmnet con validación cruzada
+train_cv_glmnet <- train(x = as.matrix(x_reduced),
+                      y = as.factor(ynum),
+                      method = "glmnet",
+                      trControl = cntrl,
+                      weights = ifelse(ynum == 1, 1.5, 1),
+                      tuneGrid = tune_grid_glm,
+                      preProcess = c("center", "scale"))  # Normaliza los datos
+
+# Mejor combinación de hiperparámetros
+best_hp_glm <- train_cv_glmnet$bestTune
+print(best_hp_glm)
+
+```
+
+```{r Logging mlflow}
+mlflow_set_experiment("score_dropout_xgboost_visa")
+mlflow_start_run(nested = T)
+# OK
+best_hp_xgboost$max_depth <- 5
+best_hp_xgboost$eta <- 0.45
+best_hp_xgboost$gamma <- 0.25
+best_hp_xgboost$nrounds <- 45
+best_hp_xgboost$colsample_bytree <- 1
+best_hp_xgboost$min_child_weight <- 1
+best_hp_xgboost$subsample <- 1
+best_hp_xgboost
+
+# Registra parámetros
+mlflow_log_param("objective", "binary:logistic")
+mlflow_log_param("max_depth", best_hp_xgboost$max_depth)
+mlflow_log_param("eta", best_hp_xgboost$eta)
+mlflow_log_param("gamma",best_hp_xgboost$gamma)
+mlflow_log_param("colsample_bytree",best_hp_xgboost$colsample_bytree)
+mlflow_log_param("min_child_weight",best_hp_xgboost$min_child_weight)
+mlflow_log_param("subsample",best_hp_xgboost$subsample)
+mlflow_log_param("nrounds",best_hp_xgboost$nrounds)
+```
+
+
+```{r Funciones de evaluacion y rendimiento}
+calculate_optimal_threshold <- function(ynum,predict) {
+  require(pROC)
+  roc_obj <- roc(ynum, predict)
+  
+  # Extraer sensibilidad y especificidad
+  sensitivities <- roc_obj$sensitivities
+  specificities <- roc_obj$specificities
+  thresholds <- roc_obj$thresholds
+  
+  # Calculando el índice de Youden
+  J <- sensitivities + specificities - 1
+  
+  # Encontrar el índice del máximo J
+  optimal_idx <- which.max(J)
+  optimal_threshold <- thresholds[optimal_idx]
+  
+  # Imprimir el umbral óptimo
+  print(paste("Optimal threshold:", optimal_threshold, " SCORE: ",round((1-optimal_threshold)*1000)))
+  return(optimal_threshold)
+}
+
+pd_table <- function(marca,score,cortes,top_good = T){
+  grupos <- data.frame(grupos = cut(score, cortes,
+                                            include.lowest=T))
+  datos <- cbind(grupos,marca,score)
+  larga = NROW(datos)
+  tabla <- datos %>% group_by(grupos) %>%
+    summarise(NoDropout = sum(marca == 0),
+              Dropout = sum(marca == 1),
+              NroEstudiantes = n(),
+              PorcDropout = sum(marca == 1)/NroEstudiantes,)
+  if (top_good) {
+    tabla$order <- 1:NROW(tabla)
+    tabla <- tabla %>% arrange(desc(order))
+  }
+  tabla <- tabla %>% select(-order)
+  tabla$Porc_Dropout_Acum <- cumsum(tabla$Dropout)/cumsum(tabla$NroEstudiantes)
+  tabla$Porc_Poblacion <- (tabla$NoDropout + tabla$Dropout)/larga
+  tabla$Porc_Acum <- cumsum(tabla$NoDropout + tabla$Dropout)/larga
+  tabla$Porc_Acum <- round(tabla$Porc_Acum*100,2)
+  tabla$Porc_Poblacion <- round(tabla$Porc_Poblacion*100,2)
+  tabla$PorcDropout <-round(tabla$PorcDropout*100,2)
+  tabla$Porc_Dropout_Acum <- round(tabla$Porc_Dropout_Acum*100,2)
+  return(tabla)
+}
+
+calculate_score <- function(x){round((1-x)*1000,0)}
+
+# Función para calcular Gini
+calculate_gini <- function(y_true, y_scores) {
+  roc_obj <- roc(y_true, y_scores)
+  auc <- auc(roc_obj)
+  return(2 * auc - 1)
+}
+
+```
+
+```{r XGBOOST - FIT }
+# Calcular el peso para las clases desbalanceadas
+num_neg <- sum(train$marca_abandono == 0)
+num_pos <- sum(train$marca_abandono == 1)
+scale_pos_weight <- 0#(num_neg / num_pos)
+
+param<- list(objective = "binary:logistic",
+             booster="gbtree",
+             eval_metric="error", max_depth = best_hp_xgboost$max_depth, 
+             eta = best_hp_xgboost$eta, gamma =best_hp_xgboost$gamma,
+             colsample_bytree = best_hp_xgboost$colsample_bytree, #scale_pos_weight = scale_pos_weight,
+             min_child_weight = best_hp_xgboost$min_child_weight, subsample = best_hp_xgboost$subsample)
+
+set.seed(1234)
+XX<-as.numeric(ynum)
+XX_test<-as.numeric(ynum_test)
+XX_toda<-as.numeric(ynum_toda)
+XX_backtest<-as.numeric(y_backtest)
+
+#Se asigna a con estructura necesaria para que el algoritmo lea los datos
+train.mat<- xgboost::xgb.DMatrix(data=as.matrix(x_reduced),label=XX)
+test.mat <- xgboost::xgb.DMatrix(data=as.matrix(x_reduced_test),label=XX_test) #,weight = weights_test
+toda.mat <- xgboost::xgb.DMatrix(data=as.matrix(x_reduced_toda),label=XX_toda)
+backtest.mat <- xgboost::xgb.DMatrix(data=as.matrix(x_backtest),label=XX_backtest)
+
+
+#se pasa el train.mat al algoritmo
+xgb.fit<- xgboost::xgb.train(params = param,
+                             data=train.mat,
+                             nrounds=best_hp_xgboost$nrounds) 
+
+xgb_pred<-(predict(xgb.fit,train.mat))
+xgb_pred_test<-(predict(xgb.fit,test.mat))
+xgb_pred_toda<-(predict(xgb.fit,toda.mat))
+xgb_pred_backtest<-(predict(xgb.fit,backtest.mat))
+
+optimal_threshold <- calculate_optimal_threshold(ynum,xgb_pred)
+
+mlflow_log_param("optimal_threshold",optimal_threshold)
+mlflow_log_param("scale_pos_weight",scale_pos_weight)
+```
+
+```{r XGBOOST - METRICAS}
+y_pred_binary <- ifelse(xgb_pred > optimal_threshold, 1, 0)
+y_pred_binary_test <- ifelse(xgb_pred_test > optimal_threshold, 1, 0)
+y_pred_binary_toda <- ifelse(xgb_pred_toda > optimal_threshold, 1, 0)
+y_pred_binary_back <- ifelse(xgb_pred_backtest > optimal_threshold, 1, 0)
+
+# Calcular la precisión y AUC
+roc_curve <- roc(ynum, xgb_pred)
+roc_curve_test <- roc(ynum_test, xgb_pred_test)
+roc_curve_toda <- roc(ynum_toda, xgb_pred_toda)
+roc_curve_back <- roc(y_backtest, xgb_pred_backtest)
+
+auc_value <- auc(roc_curve)
+auc_value_test <- auc(roc_curve_test)
+auc_value_toda <- auc(roc_curve_toda)
+auc_value_back <- auc(roc_curve_back)
+
+# Imprimir resultados
+print(paste("AUC: ", auc_value, " GINI: ", (2 * auc_value - 1)))
+print(paste("AUC: ", auc_value_test, " GINI: ", (2 * auc_value_test - 1)))
+print(paste("AUC: ", auc_value_toda, " GINI: ", (2 * auc_value_toda - 1)))
+print(paste("AUC: ", auc_value_back, " GINI: ", (2 * auc_value_back - 1)))
+
+mlflow_log_metric("auc_train", auc_value)
+mlflow_log_metric("auc_test", auc_value_test)
+mlflow_log_metric("auc_toda", auc_value_toda)
+mlflow_log_metric("auc_back", auc_value_back)
+
+mlflow_log_metric("gini_train", (2 * auc_value - 1))
+mlflow_log_metric("gini_test", (2 * auc_value_test - 1))
+mlflow_log_metric("gini_toda", (2 * auc_value_toda - 1))
+mlflow_log_metric("gini_back", (2 * auc_value_back - 1))
+
+
+
+```
+
+```{r XGBOOST - CURVAS Y MATRICES}
+{
+# Iniciar el gráfico con el primer objeto ROC
+plot(roc_curve, 
+     main = "Comparación de Curvas ROC - XGBOOST", 
+     col = "#2f4b7c", 
+     lwd = 2, 
+     xlab = "1 - Especificidad",
+     ylab = "Sensibilidad") ;
+  lines(roc_curve_test, col = "#b61c4a", lwd = 2);
+  lines(roc_curve_toda, col = "#1cb64a", lwd = 2);
+  lines(roc_curve_back, col = "#000000", lwd = 2);
+  legend("bottomright", 
+       legend = c("ROC Entrenamiento", "ROC Test", "ROC Toda la Data","ROC Backtesting"), 
+       col = c("#2f4b7c", "#b61c4a", "#1cb64a","#000000"), 
+       lwd = 2, 
+       lty = 1)
+}
+
+confusionMatrix(as.factor(y_pred_binary), as.factor(XX),positive = "1")
+confusionMatrix(as.factor(y_pred_binary_test), as.factor(XX_test),positive = "1")
+confusionMatrix(as.factor(y_pred_binary_toda), as.factor(XX_toda),positive = "1")
+confusionMatrix(as.factor(y_pred_binary_back), as.factor(XX_backtest),positive = "1")
+```
+```{r XGBOOST METRICS 2}
+# Calcular las matrices de confusión para cada conjunto de datos
+cm_train <- confusionMatrix(as.factor(y_pred_binary), as.factor(XX), positive = "1")
+cm_test <- confusionMatrix(as.factor(y_pred_binary_test), as.factor(XX_test), positive = "1")
+cm_toda <- confusionMatrix(as.factor(y_pred_binary_toda), as.factor(XX_toda), positive = "1")
+cm_back <- confusionMatrix(as.factor(y_pred_binary_back), as.factor(XX_backtest), positive = "1")
+
+# Extraer las métricas de interés de cada matriz de confusión y calcular Gini y KS
+extract_metrics <- function(cm) {
+  data.frame(
+    Accuracy = cm$overall["Accuracy"],
+    Kappa = cm$overall["Kappa"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Pos_Pred_Value = cm$byClass["Pos Pred Value"],
+    Neg_Pred_Value = cm$byClass["Neg Pred Value"]
+  )
+}
+
+# Crear una tabla con las métricas de cada conjunto de datos
+metrics_train_xgb <- extract_metrics(cm_train)
+metrics_test_xgb <- extract_metrics(cm_test)
+metrics_toda_xgb <- extract_metrics(cm_toda)
+metrics_back_xgb <- extract_metrics(cm_back)
+
+metrics_table <- bind_rows(
+  Train = metrics_train_xgb,
+  Test = metrics_test_xgb,
+  Toda = metrics_toda_xgb,
+  Back = metrics_back_xgb,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas del Modelo - XGBOOST",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cm_train_tb <- as.data.frame(cm_train$table)
+cm_test_tb <- as.data.frame(cm_test$table)
+cm_toda_tb <- as.data.frame(cm_toda$table)
+cm_back_tb <- as.data.frame(cm_back$table)
+
+# Graficar la matriz de confusión para cm_train
+plot_train <- ggplot(data = cm_train_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "XGBOOST - Matriz de Confusión - Train", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_train_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_test
+plot_test <- ggplot(data = cm_test_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Test", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_test_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_toda
+plot_toda <- ggplot(data = cm_toda_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Toda", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_toda_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_back
+plot_back <- ggplot(data = cm_back_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Backtesting", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_back_tb$Prediction)))
+
+library(patchwork)
+# Combinar los gráficos usando patchwork
+combined_plot <- plot_train + plot_test + plot_toda + plot_back + plot_layout(ncol = 2)
+
+# Mostrar el gráfico combinado
+print(combined_plot)
+```
+
+
+```{r XGBOOST - FEATURES IMPORTANCE}
+#importacia de las variables
+imp_Matrix <- xgboost::xgb.importance(feature_names = colnames(train.mat),
+                                      model=xgb.fit)
+
+gg <- xgboost::xgb.ggplot.importance(imp_Matrix,top_n = 30)+ggplot2::ylab("Importancia")+ggplot2::xlab("Features - XGBOOST")
+gridExtra::grid.arrange(gg, nrow = 1)
+
+#xgboost::xgb.ggplot.shap.summary(data = as.matrix(x_reduced),features = colnames(train.mat),model = xgb.fit)
+#xgb.plot.tree(feature_names = train %>% select(-marca_abandono) %>% colnames(), model = xgb.fit)
+
+```
+
+
+```{r XGBOOST - SCORE Y TABLA DE DISTRIBUCIÓN}
+score_train = calculate_score(xgb_pred)
+score_test = calculate_score(xgb_pred_test)
+score_toda = calculate_score(xgb_pred_toda)
+score_back = calculate_score(xgb_pred_backtest)
+
+ggplot(as.data.frame(score_test), aes(x = score_test)) +
+  geom_histogram(binwidth = 100, fill = "#2f4b7c", color = "grey") +
+  labs(title = "Xgboost: Distribución del Score Comportamental de Abandono - Testing", x = "Valores", y = "Frecuencia") +
+  theme_minimal()
+
+cortes=c(0,quantile(score_train,c(.15,0.25,.50,.75)),1000)
+cortes <- c(0,749,860,960,1000)
+
+pd_table(marca = train$marca_abandono, score = score_train,cortes = cortes)# %>% View(GB = "train_xgb")
+pd_table(marca = test$marca_abandono, score = score_test,cortes = cortes) #%>% View(title = "test_xgb")
+pd_table(marca = toda$marca_abandono, score = score_toda,cortes = cortes) #%>% View(title = "toda_xgb")
+pd_table(marca = data_model_test$marca_abandono, score = score_back, cortes = cortes) #%>% View(title = "back_xgb")
+
+```
+
+
+
+```{r XGBOOST - AIX}
+library(shapviz)
+shp <- shapviz(xgb.fit, X_pred = data.matrix(x_backtest), X = x_backtest)
+
+sv_waterfall(shp, row_id = 2) #331
+sv_force(shp, row_id = 2)
+
+sv_waterfall(shp, row_id = 3) #815
+sv_force(shp, row_id = 3)
+
+sv_waterfall(shp, row_id = 4) #988
+sv_force(shp, row_id = 4)
+
+sv_waterfall(shp, row_id = 126) #996
+sv_force(shp, row_id = 126)
+
+sv_waterfall(shp, row_id = 201) #999
+sv_force(shp, row_id = 201)
+
+```
+
+```{r RF - FIT}
+library(randomForest)
+target <- "marca_abandono"
+predictors <- setdiff(names(train), target)
+
+set.seed(1234)
+rf_model <- randomForest(reformulate(predictors, target), data = train, ntree = 500, mtry= best_hp_rf$mtry, importance = TRUE)
+
+# Predecir en el conjunto de prueba
+predictions <- predict(rf_model, train) 
+predictions_test <- predict(rf_model, test)
+predictions_toda <- predict(rf_model, toda)
+predictions_back <- predict(rf_model, data_model_test)
+
+optimal_threshold <- calculate_optimal_threshold(ynum = ynum, predict = predictions)
+
+mlflow_start_run(nested = T)
+mlflow_log_param("ntree", 500)
+mlflow_log_param("mtry", best_hp_rf$mtry)
+```
+
+```{r RF - METRICAS}
+pred <- as.integer(ifelse(predictions > optimal_threshold, 1, 0))
+pred_test <- as.integer(ifelse(predictions_test > optimal_threshold, 1, 0))
+pred_toda <- as.integer(ifelse(predictions_toda > optimal_threshold, 1, 0))
+pred_back <- as.integer(ifelse(predictions_back > optimal_threshold, 1, 0))
+
+roc_obj <- roc(ynum, predictions)
+roc_obj_test <- roc(ynum_test, predictions_test)
+roc_obj_toda <- roc(ynum_toda, predictions_toda)
+roc_obj_back <- roc(y_backtest, predictions_back)
+
+auc_value <- auc(roc_obj)
+auc_value_test <- auc(roc_obj_test)
+auc_value_toda <- auc(roc_obj_toda)
+auc_value_back<- auc(roc_obj_back)
+# Imprimir resultados
+print(paste("AUC: ", auc_value, " GINI: ", (2 * auc_value - 1)))
+print(paste("AUC: ", auc_value_test, " GINI: ", (2 * auc_value_test - 1)))
+print(paste("AUC: ", auc_value_toda, " GINI: ", (2 * auc_value_toda - 1)))
+print(paste("AUC: ", auc_value_back, " GINI: ", (2 * auc_value_back - 1)))
+
+mlflow_log_metric("auc_train", auc_value)
+mlflow_log_metric("auc_test", auc_value_test)
+mlflow_log_metric("auc_toda", auc_value_toda)
+mlflow_log_metric("auc_back", auc_value_back)
+
+mlflow_log_metric("gini_train", (2 * auc_value - 1))
+mlflow_log_metric("gini_test", (2 * auc_value_test - 1))
+mlflow_log_metric("gini_toda", (2 * auc_value_toda - 1))
+mlflow_log_metric("gini_back", (2 * auc_value_back - 1))
+```
+
+```{r RF - CURVAS Y MATRICES}
+{
+# Iniciar el gráfico con el primer objeto ROC
+plot(roc_obj, 
+     main = "Comparación de Curvas ROC - RandomForest", 
+     col = "#1c61b6", 
+     lwd = 2, 
+     xlab = "1 - Especificidad",
+     ylab = "Sensibilidad") ;
+  lines(roc_obj_test, col = "#b61c4a", lwd = 2);
+  lines(roc_obj_toda, col = "#1cb64a", lwd = 2);
+  lines(roc_obj_back, col = "#000000", lwd = 2);legend("bottomright", 
+       legend = c("ROC Entrenamiento", "ROC Test", "ROC Toda la Data","ROC Backtesting"), 
+       col = c("#1c61b6", "#b61c4a", "#1cb64a","#000000"), 
+       lwd = 2, 
+       lty = 1)
+
+}
+
+confusionMatrix(as.factor(pred), as.factor(train[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_test), as.factor(test[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_toda), as.factor(toda[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_back), as.factor(data_model_test[[target]]),positive = "1")
+```
+```{r}
+# Calcular las matrices de confusión para cada conjunto de datos
+cm_train <- confusionMatrix(as.factor(pred), as.factor(train[[target]]),positive = "1")
+cm_test <- confusionMatrix(as.factor(pred_test), as.factor(test[[target]]),positive = "1")
+cm_toda <- confusionMatrix(as.factor(pred_toda), as.factor(toda[[target]]),positive = "1")
+cm_back <- confusionMatrix(as.factor(pred_back), as.factor(data_model_test[[target]]),positive = "1")
+
+# Extraer las métricas de interés de cada matriz de confusión
+extract_metrics <- function(cm) {
+  data.frame(
+    Accuracy = cm$overall["Accuracy"],
+    Kappa = cm$overall["Kappa"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Pos_Pred_Value = cm$byClass["Pos Pred Value"],
+    Neg_Pred_Value = cm$byClass["Neg Pred Value"]
+  )
+}
+
+# Crear una tabla con las métricas de cada conjunto de datos
+metrics_train_rf <- extract_metrics(cm_train)
+metrics_test_rf <- extract_metrics(cm_test)
+metrics_toda_rf <- extract_metrics(cm_toda)
+metrics_back_rf <- extract_metrics(cm_back)
+
+metrics_table <- bind_rows(
+  Train = metrics_train_rf,
+  Test = metrics_test_rf,
+  Toda = metrics_toda_rf,
+  Back = metrics_back_rf,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas del Modelo - RANDOM FOREST",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cm_train_tb <- as.data.frame(cm_train$table)
+cm_test_tb <- as.data.frame(cm_test$table)
+cm_toda_tb <- as.data.frame(cm_toda$table)
+cm_back_tb <- as.data.frame(cm_back$table)
+
+# Graficar la matriz de confusión para cm_train
+plot_train <- ggplot(data = cm_train_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "RandomForest - Train", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_train_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_test
+plot_test <- ggplot(data = cm_test_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Test", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_test_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_toda
+plot_toda <- ggplot(data = cm_toda_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Toda", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_toda_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_back
+plot_back <- ggplot(data = cm_back_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Backtesting", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_back_tb$Prediction)))
+
+library(patchwork)
+# Combinar los gráficos usando patchwork
+combined_plot <- plot_train + plot_test + plot_toda + plot_back + plot_layout(ncol = 2)
+
+# Mostrar el gráfico combinado
+print(combined_plot)
+```
+
+```{r RF - FEATURES IMPORTANCE}
+# Extrae la importancia de las características
+importance_df <- as.data.frame(importance(rf_model))
+importance_df$Feature <- row.names(importance_df)
+
+ggplot(importance_df %>% head(31), aes(x = reorder(Feature, `%IncMSE`), y = `%IncMSE`)) +
+  geom_bar(stat = "identity", fill = "#2f4b7c") +
+  coord_flip() +  # Voltea el gráfico para mejor legibilidad
+  labs(title = "Importancia de las Características Random Forest",
+       x = "Características",
+       y = "% Incremento del MSE") +
+  theme_minimal()
+
+```
+
+```{r RF - SCORE Y TABLA DE DISTRIBUCIÓN}
+score_rf_train = calculate_score(predictions)
+score_rf_test = calculate_score(predictions_test)
+score_rf_toda = calculate_score(predictions_toda)
+score_rf_back = calculate_score(predictions_back)
+
+ggplot(as.data.frame(score_rf_test), aes(x = score_rf_test)) +
+  geom_histogram(binwidth = 50, fill = "#2f4b7c", color = "grey") +
+  labs(title = "RandomForest: Distribución del Score Comportamental de Abandono - Backtesting", x = "Valores", y = "Frecuencia") +
+  theme_minimal()
+
+#cortes=c(0,quantile(score_rf_train,c(.15,.25,.50,.75)),1000)
+cortes <- c(0,649,749,875,1000)
+#TRAIN
+pd_table(marca = train$marca_abandono, score = score_rf_train,cortes = cortes)# %>% View(title = "train_xgb")
+pd_table(marca = test$marca_abandono, score = score_rf_test,cortes = cortes) #%>% View(title = "test_xgb")
+pd_table(marca = toda$marca_abandono, score = score_rf_toda,cortes = cortes) #%>% View(title = "toda_xgb")
+pd_table(marca = data_model_test$marca_abandono, score = score_rf_back, cortes = cortes) #%>% View(title = "back_xgb")
+
+```
+
+```{r RF - AIX}
+library(DALEX)
+library(DALEXtra)
+
+explain_rf  <- DALEX::explain(model = rf_model, 
+                          data = x_reduced,
+                          y = ynum, 
+                          label = "Random Forest Explainability")
+
+student_993 <- x_backtest[15,]
+student_848 <- x_reduced[991,]
+student_678 <- x_reduced[908,]
+student_435 <- x_reduced[476,]
+
+
+bd_rf <- predict_parts(explainer = explain_rf,
+                       new_observation = student_848,
+                       type = "break_down") 
+
+
+
+shap_rf <- predict_parts(explainer = explain_rf,
+                       new_observation = student_848,
+                       type = "shap",
+                       B = 25) 
+
+
+plot(bd_rf)
+plot(shap_rf)
+
+bd_rf <- predict_parts(explainer = explain_rf,
+                       new_observation = student_678,
+                       type = "break_down")
+
+
+
+shap_rf <- predict_parts(explainer = explain_rf,
+                       new_observation = student_678,
+                       type = "shap",
+                       B = 25)
+
+
+plot(bd_rf)
+plot(shap_rf)
+
+bd_rf <- predict_parts(explainer = explain_rf,
+                       new_observation = student_435,
+                       type = "break_down")
+
+
+
+shap_rf <- predict_parts(explainer = explain_rf,
+                       new_observation = student_435,
+                       type = "shap",
+                       B = 25)
+
+
+plot(bd_rf)
+plot(shap_rf)
+```
+
+
+```{r LOGIT REG. RIDGE - FIT }
+library(tidyverse)
+library(glmnet)
+library(scales)
+# Creaci?n y entrenamiento del modelo
+# ==============================================================================
+# Para obtener un ajuste con regularizaci?n Ridge se indica argumento alpha=0.
+# Si no se especifica valor de lambda, se selecciona un rango autom?tico.
+set.seed(1234)
+glm_model <- glmnet(
+  x           = as.matrix(x_reduced),
+  y           = ynum,
+  alpha       = best_hp_glm$alpha,
+  lambda = best_hp_glm$lambda,
+  family = "binomial"
+)
+
+# Predecir en el conjunto de prueba
+predictions <- predict(glm_model, as.matrix(x_reduced),type = "response", s=best_hp_glm$lambda)
+predictions_test <- predict(glm_model, as.matrix(x_reduced_test),type = "response", s=best_hp_glm$lambda)
+predictions_toda <- predict(glm_model, as.matrix(x_reduced_toda),type = "response", s=best_hp_glm$lambda)
+predictions_back <- predict(glm_model, as.matrix(x_backtest),type = "response", s=best_hp_glm$lambda)
+
+optimal_threshold <- calculate_optimal_threshold(ynum = ynum, predict = predictions)
+```
+
+```{r LOGIT REG. RIDGE - METRICAS}
+pred <- as.integer(ifelse(predictions > optimal_threshold, 1, 0))
+pred_test <- as.integer(ifelse(predictions_test > optimal_threshold, 1, 0))
+pred_toda <- as.integer(ifelse(predictions_toda > optimal_threshold, 1, 0))
+pred_back <- as.integer(ifelse(predictions_back > optimal_threshold, 1, 0))
+
+roc_obj <- roc(ynum, predictions)
+roc_obj_test <- roc(ynum_test, predictions_test)
+roc_obj_toda <- roc(ynum_toda, predictions_toda)
+roc_obj_back <- roc(y_backtest, predictions_back)
+
+auc_value <- auc(roc_obj)
+auc_value_test <- auc(roc_obj_test)
+auc_value_toda <- auc(roc_obj_toda)
+auc_value_back<- auc(roc_obj_back)
+# Imprimir resultados
+print(paste("AUC: ", auc_value, " GINI: ", (2 * auc_value - 1)))
+print(paste("AUC: ", auc_value_test, " GINI: ", (2 * auc_value_test - 1)))
+print(paste("AUC: ", auc_value_toda, " GINI: ", (2 * auc_value_toda - 1)))
+print(paste("AUC: ", auc_value_back, " GINI: ", (2 * auc_value_back - 1)))
+```
+
+```{r LOGIT REG. RIDGE - CURVAS Y MATRICES}
+{
+# Iniciar el gráfico con el primer objeto ROC
+plot(roc_obj, 
+     main = "REG. ELASTIC NET - Comparación de Curvas ROC", 
+     col = "#1c61b6", 
+     lwd = 2, 
+     xlab = "1 - Especificidad",
+     ylab = "Sensibilidad") ;
+  lines(roc_obj_test, col = "#b61c4a", lwd = 2);
+  lines(roc_obj_toda, col = "#1cb64a", lwd = 2);
+  lines(roc_obj_back, col = "#000000", lwd = 2);legend("bottomright", 
+       legend = c("ROC Entrenamiento", "ROC Test", "ROC Toda la Data","ROC Backtesting"), 
+       col = c("#1c61b6", "#b61c4a", "#1cb64a","#000000"), 
+       lwd = 2, 
+       lty = 1)
+
+}
+
+confusionMatrix(as.factor(pred), as.factor(train[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_test), as.factor(test[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_toda), as.factor(toda[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_back), as.factor(data_model_test[[target]]),positive = "1")
+```
+```{r}
+# Calcular las matrices de confusión para cada conjunto de datos
+cm_train <- confusionMatrix(as.factor(pred), as.factor(train[[target]]),positive = "1")
+cm_test <- confusionMatrix(as.factor(pred_test), as.factor(test[[target]]),positive = "1")
+cm_toda <- confusionMatrix(as.factor(pred_toda), as.factor(toda[[target]]),positive = "1")
+cm_back <- confusionMatrix(as.factor(pred_back), as.factor(data_model_test[[target]]),positive = "1")
+
+# Extraer las métricas de interés de cada matriz de confusión
+extract_metrics <- function(cm) {
+  data.frame(
+    Accuracy = cm$overall["Accuracy"],
+    Kappa = cm$overall["Kappa"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Pos_Pred_Value = cm$byClass["Pos Pred Value"],
+    Neg_Pred_Value = cm$byClass["Neg Pred Value"]
+  )
+}
+
+# Crear una tabla con las métricas de cada conjunto de datos
+metrics_train_glm <- extract_metrics(cm_train)
+metrics_test_glm <- extract_metrics(cm_test)
+metrics_toda_glm <- extract_metrics(cm_toda)
+metrics_back_glm <- extract_metrics(cm_back)
+
+metrics_table <- bind_rows(
+  Train = metrics_train_glm,
+  Test = metrics_test_glm,
+  Toda = metrics_toda_glm,
+  Back = metrics_back_glm,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas del Modelo - REGRESIÓN ELASTIC NET",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cm_train_tb <- as.data.frame(cm_train$table)
+cm_test_tb <- as.data.frame(cm_test$table)
+cm_toda_tb <- as.data.frame(cm_toda$table)
+cm_back_tb <- as.data.frame(cm_back$table)
+
+# Graficar la matriz de confusión para cm_train
+plot_train <- ggplot(data = cm_train_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "ELASTIC NET - Matriz de Confusión - Train", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_train_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_test
+plot_test <- ggplot(data = cm_test_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Test", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_test_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_toda
+plot_toda <- ggplot(data = cm_toda_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Toda", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_toda_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_back
+plot_back <- ggplot(data = cm_back_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Back", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_back_tb$Prediction)))
+
+library(patchwork)
+# Combinar los gráficos usando patchwork
+combined_plot <- plot_train + plot_test + plot_toda + plot_back + plot_layout(ncol = 2)
+
+# Mostrar el gráfico combinado
+print(combined_plot)
+```
+
+```{r LOGIT REG. RIDGE - FEATURES IMPORTANCE}
+coef(glm_model) 
+
+# Coeficientes del modelo
+# ==============================================================================
+df_coeficientes <- coef(glm_model) %>%
+  as.matrix() %>%
+  as_tibble(rownames = "predictor") %>%
+  rename(coeficiente = s0)
+
+df_coeficientes %>%
+  filter(predictor != "(Intercept)") %>%
+  ggplot(aes(x = predictor, y = coeficiente)) +
+  geom_col() +
+  labs(title = "Coeficientes del modelo Ridge") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 6, angle = 45))
+
+```
+
+```{r LOGIT REG. RIDGE - SCORE Y TABLA DE DISTRIBUCIÓN}
+score_glm_train = calculate_score(predictions)
+score_glm_test = calculate_score(predictions_test)
+score_glm_toda = calculate_score(predictions_toda)
+score_glm_back = calculate_score(predictions_back)
+
+cortes=c(0,quantile(score_glm_train,c(.15,.25,.60,.90)),1000)
+
+#TRAIN
+pd_table(marca = train$marca_abandono, score = score_glm_train,cortes = cortes)# %>% View(title = "train_xgb")
+pd_table(marca = test$marca_abandono, score = score_glm_test,cortes = cortes) #%>% View(title = "test_xgb")
+pd_table(marca = toda$marca_abandono, score = score_glm_toda,cortes = cortes) #%>% View(title = "toda_xgb")
+pd_table(marca = data_model_test$marca_abandono, score = score_glm_back, cortes = cortes) #%>% View(title = "back_xgb")
+
+```
+
+
+```{r SVM - FIT}
+library("e1071")
+
+# Entrenar un modelo de Support Vector Machine (SVM)
+svm_model <- svm(reformulate(predictors, target), data = train, kernel = "radial", cost = best_hp_svm$C, gamma = best_hp_svm$sigma)
+
+# Predecir en el conjunto de prueba
+predictions <- predict(svm_model, x_reduced)
+predictions_test <- predict(svm_model, x_reduced_test)
+predictions_toda <- predict(svm_model, x_reduced_toda)
+predictions_back <- predict(svm_model, x_backtest)
+
+optimal_threshold <- calculate_optimal_threshold(ynum = ynum, predict = predictions)
+
+```
+```{r SVM - METRICAS}
+pred <- as.integer(ifelse(predictions > optimal_threshold, 1, 0))
+pred_test <- as.integer(ifelse(predictions_test > optimal_threshold, 1, 0))
+pred_toda <- as.integer(ifelse(predictions_toda > optimal_threshold, 1, 0))
+pred_back <- as.integer(ifelse(predictions_back > optimal_threshold, 1, 0))
+
+roc_obj <- roc(ynum, predictions)
+roc_obj_test <- roc(ynum_test, predictions_test)
+roc_obj_toda <- roc(ynum_toda, predictions_toda)
+roc_obj_back <- roc(y_backtest, predictions_back)
+
+auc_value <- auc(roc_obj)
+auc_value_test <- auc(roc_obj_test)
+auc_value_toda <- auc(roc_obj_toda)
+auc_value_back<- auc(roc_obj_back)
+# Imprimir resultados
+print(paste("AUC: ", auc_value, " GINI: ", (2 * auc_value - 1)))
+print(paste("AUC: ", auc_value_test, " GINI: ", (2 * auc_value_test - 1)))
+print(paste("AUC: ", auc_value_toda, " GINI: ", (2 * auc_value_toda - 1)))
+print(paste("AUC: ", auc_value_back, " GINI: ", (2 * auc_value_back - 1)))
+```
+
+```{r SVM - CURVAS Y MATRICES}
+{
+# Iniciar el gráfico con el primer objeto ROC
+plot(roc_obj, 
+     main = "Comparación de Curvas ROC", 
+     col = "#1c61b6", 
+     lwd = 2, 
+     xlab = "1 - Especificidad",
+     ylab = "Sensibilidad") ;
+  lines(roc_obj_test, col = "#b61c4a", lwd = 2);
+  lines(roc_obj_toda, col = "#1cb64a", lwd = 2);
+  lines(roc_obj_back, col = "#000000", lwd = 2);legend("bottomright", 
+       legend = c("ROC Entrenamiento", "ROC Test", "ROC Toda la Data","ROC Backtesting"), 
+       col = c("#1c61b6", "#b61c4a", "#1cb64a","#000000"), 
+       lwd = 2, 
+       lty = 1)
+
+}
+
+confusionMatrix(as.factor(pred), as.factor(train[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_test), as.factor(test[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_toda), as.factor(toda[[target]]),positive = "1")
+confusionMatrix(as.factor(pred_back), as.factor(data_model_test[[target]]),positive = "1")
+```
+```{r SVM - COMPARACION DE METRICAS}
+# Calcular las matrices de confusión para cada conjunto de datos
+cm_train <- confusionMatrix(as.factor(pred), as.factor(train[[target]]),positive = "1")
+cm_test <- confusionMatrix(as.factor(pred_test), as.factor(test[[target]]),positive = "1")
+cm_toda <- confusionMatrix(as.factor(pred_toda), as.factor(toda[[target]]),positive = "1")
+cm_back <- confusionMatrix(as.factor(pred_back), as.factor(data_model_test[[target]]),positive = "1")
+
+# Extraer las métricas de interés de cada matriz de confusión
+extract_metrics <- function(cm) {
+  data.frame(
+    Accuracy = cm$overall["Accuracy"],
+    Kappa = cm$overall["Kappa"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    Pos_Pred_Value = cm$byClass["Pos Pred Value"],
+    Neg_Pred_Value = cm$byClass["Neg Pred Value"]
+  )
+}
+
+# Crear una tabla con las métricas de cada conjunto de datos
+metrics_train_svm <- extract_metrics(cm_train)
+metrics_test_svm <- extract_metrics(cm_test)
+metrics_toda_svm <- extract_metrics(cm_toda)
+metrics_back_svm <- extract_metrics(cm_back)
+
+metrics_table <- bind_rows(
+  Train = metrics_train_svm,
+  Test = metrics_test_svm,
+  Toda = metrics_toda_svm,
+  Back = metrics_back_svm,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas del Modelo - SVM",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+cm_train_tb <- as.data.frame(cm_train$table)
+cm_test_tb <- as.data.frame(cm_test$table)
+cm_toda_tb <- as.data.frame(cm_toda$table)
+cm_back_tb <- as.data.frame(cm_back$table)
+
+# Graficar la matriz de confusión para cm_train
+plot_train <- ggplot(data = cm_train_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "SVM - Matriz de Confusión - Train", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_train_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_test
+plot_test <- ggplot(data = cm_test_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Matriz de Confusión - Test", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_test_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_toda
+plot_toda <- ggplot(data = cm_toda_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Matriz de Confusión - Toda", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_toda_tb$Prediction)))
+
+# Graficar la matriz de confusión para cm_back
+plot_back <- ggplot(data = cm_back_tb, aes(x = Reference, y = Prediction)) +
+  geom_tile(aes(fill = Freq), color = "white") +
+  scale_fill_gradient(low = "white", high = "#2f4b7c") +
+  geom_text(aes(label = Freq), vjust = 1) +
+  theme_minimal() +
+  labs(title = "Matriz de Confusión - Back", fill = "Frecuencia") +
+  scale_y_discrete(limits = rev(levels(cm_back_tb$Prediction)))
+
+library(patchwork)
+# Combinar los gráficos usando patchwork
+combined_plot <- plot_train + plot_test + plot_toda + plot_back + plot_layout(ncol = 2)
+
+# Mostrar el gráfico combinado
+print(combined_plot)
+```
+```{r COMPARACIÓN DE METRICAS PARA LOS DIFERENTES MODELOS}
+############################ TRAIN
+metrics_table <- bind_rows(
+  xgboost = metrics_train_xgb,
+  rf = metrics_train_rf,
+  svm = metrics_train_svm,
+  glm = metrics_train_glm,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas de los Modelos - TRAIN",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+############################ TEST 
+metrics_table <- bind_rows(
+  xgboost = metrics_test_xgb,
+  rf = metrics_test_rf,
+  svm = metrics_test_svm,
+  glm = metrics_test_glm,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas de los Modelos - TEST",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+############################ TODA 
+metrics_table <- bind_rows(
+  xgboost = metrics_toda_xgb,
+  rf = metrics_toda_rf,
+  svm = metrics_toda_svm,
+  glm = metrics_toda_glm,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas de los Modelos - TODA",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+############################ BACK 
+metrics_table <- bind_rows(
+  xgboost = metrics_back_xgb,
+  rf = metrics_back_rf,
+  svm = metrics_back_svm,
+  glm = metrics_back_glm,
+  .id = "Dataset"
+)
+
+# Crear el gráfico comparativo
+library(reshape2)
+# Convertir la tabla en formato largo para ggplot
+metrics_long <- melt(metrics_table, id.vars = "Dataset")
+
+# Definir una paleta de colores cálidos en tonalidad de azules
+color_palette <- c("#4B9CD3", "#1C6BA0", "#2F4B7C", "#1D3557")
+
+# Graficar con colores personalizados
+ggplot(metrics_long, aes(x = Dataset, y = value, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+   geom_text(aes(label = round(value, 3)), vjust = 1.3, position = position_dodge(0.9), size = 3, color = "white") +
+  facet_wrap(~variable, scales = "free_y") +
+  labs(title = "Comparación de Métricas de los Modelos - BACKTESTING",
+       x = "Conjunto de Datos",
+       y = "Valor") +
+  scale_fill_manual(values = color_palette) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
